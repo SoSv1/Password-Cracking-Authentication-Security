@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title></title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module" src="scripts/scripts.js"></script>
+</head>
+<body class="login" data-page="login">
+  <main>
+    <h1 data-text="teamHeading"></h1>
+    <form id="login-form">
+      <label for="username" data-text="username"></label>
+      <input id="username" name="username" autocomplete="username" required maxlength="64">
+      <label for="password" data-text="password"></label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button id="login-button" type="submit" data-text="login"></button>
+    </form>
+    <p id="message" role="status" aria-live="polite"></p>
+  </main>
+</body>
+</html>
