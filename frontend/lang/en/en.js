@@ -1,5 +1,5 @@
 export const EnglishStrings = Object.freeze({
-  loginTitle: 'Team prjD5 — Login',
+  loginTitle: 'Team prjD5 - Login',
   teamHeading: 'Team prjD5',
   username: 'Username',
   password: 'Password',
@@ -19,7 +19,7 @@ export const EnglishStrings = Object.freeze({
   requestError: 'The request could not be completed. Please try again.',
   invalidCredentials: 'Invalid username or password.',
   invalidInput: 'Enter a username and a password of up to 6 characters.',
-  tooManyRequests: 'Too many login attempts. Please wait a minute and try again.',
+  tooManyRequests: 'Login is busy or too many attempts were made. Please wait and try again.',
   originDenied: 'This frontend origin is not allowed by the server configuration.',
   payloadTooLarge: 'The submitted information is too large.',
 

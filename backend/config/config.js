@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 export class Config {
   constructor(environment = process.env) {
     this.isProduction = environment.NODE_ENV === 'production';
@@ -15,14 +17,38 @@ export class Config {
     this.cookieSameSite = environment.COOKIE_SAME_SITE || (this.isProduction ? 'None' : 'Lax');
 
     this.bodyLimitBytes = 1024;
-    this.loginWindowMs = 60_000;
-    this.loginAttemptsPerWindow = 10;
+    this.loginBodyTimeoutMs = this.#integer(environment, 'LOGIN_BODY_TIMEOUT_MS', 2000, 100, 3000);
+    this.loginConcurrency = this.#integer(environment, 'LOGIN_CONCURRENCY', 4, 1, 4);
+    this.loginQueueSize = this.#integer(environment, 'LOGIN_QUEUE_SIZE', 24, 0, 64);
+    this.loginQueueWaitMs = this.#integer(environment, 'LOGIN_QUEUE_WAIT_MS', 1000, 50, 1500);
+    this.loginWindowMs = this.#integer(environment, 'LOGIN_WINDOW_MS', 60_000, 1000, 300_000);
+    this.loginAttemptsPerWindow = this.#integer(environment, 'LOGIN_ATTEMPTS_PER_WINDOW', 30, 1, 300);
+    this.loginMaxClients = this.#integer(environment, 'LOGIN_MAX_CLIENTS', 4096, 1, 10_000);
+    // Unknown hosting topology: shared socket addresses must not lock out all clients.
+    this.loginClientIpMode = environment.LOGIN_CLIENT_IP_MODE || 'unknown';
+    this.trustedProxyIps = Object.freeze((environment.TRUSTED_PROXY_IPS || '')
+      .split(',').map((address) => address.trim()).filter(Boolean));
 
     this.#validate();
     Object.freeze(this);
   }
 
+  #integer(environment, name, fallback, minimum, maximum) {
+    const value = Number(environment[name] ?? fallback);
+
+    if (!Number.isInteger(value) || value < minimum || value > maximum) {
+      throw new Error(`${name} must be an integer between ${minimum} and ${maximum}.`);
+    }
+
+    return value;
+  }
+
   #validate() {
+    if (!['unknown', 'direct'].includes(this.loginClientIpMode)
+      || this.trustedProxyIps.some((address) => address.includes('%') || !isIP(address))) {
+      throw new Error('Use LOGIN_CLIENT_IP_MODE=unknown|direct and exact IPs in TRUSTED_PROXY_IPS.');
+    }
+
     if (!Number.isInteger(this.port) || this.port < 1 || this.port > 65535) {
       throw new Error('PORT must be an integer between 1 and 65535.');
     }

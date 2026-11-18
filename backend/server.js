@@ -8,13 +8,16 @@ class Application {
   async start() {
     const config = new Config();
 
-    const authService = new AuthService();
+    const authService = new AuthService(config);
     await authService.initialize(config.adminUsername, config.adminPassword);
 
     const router = new HttpRouter(config, authService, new JwtService(config));
 
-    const server = createServer({ maxHeaderSize: 16_384 }, (request, response) => {
-      void router.handle(request, response);
+    const server = createServer({ maxHeaderSize: 16_384, connectionsCheckingInterval: 1000 }, (request, response) => {
+      // No per-request attack logging; contain even unexpected response/stream failures.
+      request.on('error', () => {});
+      response.on('error', () => {});
+      void router.handle(request, response).catch(() => response.destroy());
     });
 
     server.requestTimeout = 15_000;

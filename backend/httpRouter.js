@@ -14,6 +14,7 @@ export class HttpRouter {
   #auth;
   #jwt;
   #rateLimiter;
+  #pendingLogins = 0;
   #methods = new Map([
     ['/health', 'GET'],
     ['/api/login', 'POST'],
@@ -43,6 +44,8 @@ export class HttpRouter {
       const method = this.#methods.get(path);
 
       if (!method) throw new HttpError(404, 'NOT_FOUND');
+
+      if (path !== '/api/login') this.#closeUnread(request, response);
 
       if (request.method === 'OPTIONS') {
         this.#preflight(request, response, method);
@@ -76,6 +79,7 @@ export class HttpRouter {
       const status = error instanceof HttpError ? error.status : 500;
       const code = error instanceof HttpError ? error.code : 'INTERNAL_ERROR';
 
+      this.#closeUnread(request, response);
       this.#json(response, status, { ok: false, error: { code } });
     }
   }
@@ -116,74 +120,122 @@ export class HttpRouter {
   }
 
   async #login(request, response) {
-    // Use the socket address, never an untrusted X-Forwarded-For header.
-    const retryAfter = this.#rateLimiter.check(request.socket.remoteAddress);
+    const retryAfter = this.#rateLimiter.check(request);
 
     if (retryAfter) {
       response.setHeader('Retry-After', String(retryAfter));
       throw new HttpError(429, 'TOO_MANY_REQUESTS');
     }
 
-    const body = await this.#readJson(request);
-
-    if (!body || typeof body !== 'object' || Array.isArray(body)
-      || typeof body.username !== 'string' || typeof body.password !== 'string'
-      || !body.username || body.username.length > 64 || !body.password
-      || [...body.password].length > 6) throw new HttpError(400, 'INVALID_INPUT');
-
-    const valid = await this.#auth.verifyCredentials(body.username, body.password);
-
-    if (valid === null) {
+    // Reserve before reading bodies: even slow uploads cannot create unbounded waiters.
+    if (this.#pendingLogins >= this.#config.loginConcurrency + this.#config.loginQueueSize) {
       response.setHeader('Retry-After', '1');
       throw new HttpError(429, 'TOO_MANY_REQUESTS');
     }
 
-    if (!valid) throw new HttpError(401, 'INVALID_CREDENTIALS');
+    this.#pendingLogins += 1;
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    response.once('close', abort);
 
-    // The stable subject and key deliberately survive credential changes and logout.
-    response.setHeader('Set-Cookie', this.#cookie(this.#jwt.sign('admin')));
-    this.#json(response, 200, { ok: true });
+    try {
+      const body = await this.#readJson(request);
+
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || typeof body.username !== 'string' || typeof body.password !== 'string'
+        || !body.username || body.username.length > 64 || !body.password
+        || [...body.password].length > 6) throw new HttpError(400, 'INVALID_INPUT');
+
+      const valid = await this.#auth.verifyCredentials(body.username, body.password, controller.signal);
+
+      if (response.destroyed) return;
+
+      if (valid === null) {
+        response.setHeader('Retry-After', '1');
+        throw new HttpError(429, 'TOO_MANY_REQUESTS');
+      }
+
+      if (!valid) throw new HttpError(401, 'INVALID_CREDENTIALS');
+
+      // The stable subject and key deliberately survive credential changes and logout.
+      response.setHeader('Set-Cookie', this.#cookie(this.#jwt.sign('admin')));
+      this.#json(response, 200, { ok: true });
+    } finally {
+      response.off('close', abort);
+      this.#pendingLogins -= 1;
+    }
   }
 
   #readJson(request) {
     if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
-      request.resume();
       throw new HttpError(400, 'INVALID_INPUT');
+    }
+
+    if (Number(request.headers['content-length']) > this.#config.bodyLimitBytes) {
+      throw new HttpError(413, 'PAYLOAD_TOO_LARGE');
     }
 
     return new Promise((resolve, reject) => {
       const chunks = [];
       let size = 0;
-      let failed = false;
+      const finish = (error, body) => {
+        clearTimeout(timer);
+        request.off('data', onData);
+        request.off('end', onEnd);
+        request.off('error', onError);
+        request.off('aborted', onError);
+        chunks.length = 0;
 
-      request.on('data', (chunk) => {
-        if (failed) return;
+        if (error) {
+          request.pause();
+          reject(error);
+        } else resolve(body);
+      };
 
+      const onData = (chunk) => {
         size += chunk.length;
 
         if (size > this.#config.bodyLimitBytes) {
-          failed = true;
-          chunks.length = 0;
-          reject(new HttpError(413, 'PAYLOAD_TOO_LARGE'));
+          finish(new HttpError(413, 'PAYLOAD_TOO_LARGE'));
           return;
         }
 
         chunks.push(chunk);
-      });
+      };
 
-      request.on('end', () => {
-        if (failed) return;
-
+      const onEnd = () => {
         try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          finish(null, body);
         } catch {
-          reject(new HttpError(400, 'INVALID_INPUT'));
+          finish(new HttpError(400, 'INVALID_INPUT'));
         }
-      });
+      };
+      const onError = () => finish(new HttpError(400, 'INVALID_INPUT'));
+      // Absolute body deadline, not an idle timeout that slow trickles can extend.
+      const timer = setTimeout(() => finish(new HttpError(408, 'REQUEST_TIMEOUT')),
+        this.#config.loginBodyTimeoutMs);
 
-      request.on('error', () => reject(new HttpError(400, 'INVALID_INPUT')));
-      request.on('aborted', () => reject(new HttpError(400, 'INVALID_INPUT')));
+      request.on('data', onData);
+      request.once('end', onEnd);
+      request.once('error', onError);
+      request.once('aborted', onError);
+
+      if (request.destroyed) onError();
     });
+  }
+
+  #closeUnread(request, response) {
+    const hasBody = request.headers['transfer-encoding'] || Number(request.headers['content-length']) > 0;
+
+    if (request.readableEnded || !hasBody) return;
+
+    // Send the error first, then close; never drain an unlimited rejected upload.
+    request.pause();
+    response.setHeader('Connection', 'close');
+    response.shouldKeepAlive = false;
+    // Node closes after flushing a Connection: close response; an immediate destroy
+    // here could reset the socket before the client receives the error.
   }
 
   #readCookie(request) {
